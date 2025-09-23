@@ -1,12 +1,16 @@
 from fastapi import FastAPI, HTTPException
 
 from typing import Any
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
 from numpy.f2py.auxfuncs import throw_error
 
 from pymilvus import MilvusClient
 from frontmatter import Frontmatter
 from langchain_text_splitters import MarkdownHeaderTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
 import os
 from datetime import datetime
@@ -15,18 +19,29 @@ from tools.LeafSnowflakeTool import LeafSnowflakeBuilder
 from env_settings.settrings import Settings
 from log.logger import setup_logger
 
+from langchain_milvus import Milvus
 app = FastAPI()
 
 settings = Settings()
 
 logger = setup_logger()
 
-embeddingModel = OpenAIEmbeddings(model="text-embedding-3-large",dimensions=1024)
+llm = ChatOpenAI(model_name="gpt-4", temperature=0.7)
+embeddingModel = OpenAIEmbeddings(model="text-embedding-3-large",dimensions=1524)
 
 # https://github.com/langchain-ai/langchain-milvus/blob/fa642cac6512b9b7e04a786d7e644b675ca90d92/libs/milvus/langchain_milvus/vectorstores/zilliz.py
 vector_store = MilvusClient(
     uri = settings.milvus_uri,
     token = settings.milvus_token,
+)
+
+vectorStore = Milvus(
+    embedding_function=embeddingModel,
+    connection_args={
+        "uri": settings.milvus_uri,
+        "token": settings.milvus_token,
+    },
+    drop_old=False,
 )
 
 def load_markdown_file(markdown_path: str) -> list[dict[str, Any]]:
@@ -45,10 +60,11 @@ def load_markdown_file(markdown_path: str) -> list[dict[str, Any]]:
                 document = {
                     "doc_id":IdGenerator.get_id(),
                     "meta_data":{"source": mdpath},
-                    "title": fm.get("attributes", {}).get("title", ""),
+                    "doc_title": fm.get("attributes", {}).get("title", ""),
                     "doc_description": fm.get("attributes", {}).get("description", ""),
                     "tags":fm.get("attributes",{}).get("tags") or [] ,
                     "content": fm.get("body",""),
+                    "doc_source": mdpath,
                 }
                 resList.append(document)
             else:
@@ -95,7 +111,8 @@ def markdown_chunk_spilt(list_markdown_data: list[dict[str, Any]]) -> list[dict[
                     doc = {
                         "doc_id": doc.get("doc_id"),
                         "meta_data": doc.get("meta_data"),
-                        "title": doc.get("title"),
+                        "doc_title": doc.get("title"),
+                        "doc_source": doc.get("doc_source"),
                         "doc_description": doc.get("doc_description"),
                         "tags": doc.get("tags"),
                         "content": markdown.page_content,
@@ -128,7 +145,7 @@ def markdown_store(documents: list) -> dict[str, Any]:
     ans:dict[str, Any] = {}
     try:
         for doc in documents:
-            doc["created_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            doc["created_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         ans = vector_store.insert(collection_name="rag",data=documents)
     except Exception as e:
@@ -159,8 +176,8 @@ async def root():
     logger.info(f"Hello World {settings.milvus_uri}")
     return {"code":200,"message": "Hello World"}
 
-@app.get("/markdown/process/{markdown_file_path}")
-async def markdown_process(markdown_file_path: str):
+@app.get("/markdown/full_refresh/{markdown_file_path}")
+async def markdown_full_refresh(markdown_file_path: str):
     try:
         markdownDocumentData = load_markdown_file(markdown_file_path)
         docList = markdown_chunk_spilt(markdownDocumentData)
@@ -171,6 +188,67 @@ async def markdown_process(markdown_file_path: str):
         logger.error(f"markdown_process failed: {e}")
         raise HTTPException(status_code=500, detail=f"markdown_process failed: {e}")
 
+@app.get("/markdown/incremental update/{markdown_file_path}")
+async def markdown_incremental_update(markdown_file_path: str):
+    try:
+        res = vector_store.query(collection_name="rag",filter=f"doc_source == {markdown_file_path}" )
+        if len(res) <= 0:
+            raise HTTPException(status_code=500,detail="Markdown File {markdown_file_path} not found")
+        else:
+           data = vector_store.delete(collection_name="rag", filter=f"id in {[item.id for item in res.data]}")
+
+           # {
+           #   "code": 0,
+           #   "data": {
+           #     "deleteCount": 1
+           #   }
+           # }
+        if data.data.deleteCcount != 0:
+            raise HTTPException(status_code=500, detail="Markdown File incremental update failed")
+        markdownDocumentData = load_markdown_file(markdown_file_path)
+        docList = markdown_chunk_spilt(markdownDocumentData)
+        data = markdown_chunk_embedding(docList)
+        result = markdown_store(data)
+        return {"code": 200, "message": "success", "data": result.get("insert_count")}
+    except Exception as e:
+        logger.error(f"markdown_process failed: {e}")
+        raise HTTPException(status_code=500, detail=f"markdown_process failed: {e}")
+
+    pass
 @app.get("/search")
-async def search():
-    return {"code": 200, "message": "Hello World"}
+async def search(query:str) -> dict[str, Any]:
+    PROMPT_TEMPLATE = """
+    Human: You are an AI assistant, and provides answers to questions by using fact based and statistical information when possible.
+    Use the following pieces of information to provide a concise answer to the question enclosed in <question> tags.
+    If you don't know the answer, just say that you don't know, don't try to make up an answer.
+    <context>
+    {context}
+    </context>
+
+    <question>
+    {question}
+    </question>
+
+    The response should be specific and use statistics or numbers when possible.
+
+    Assistant:
+    """
+    prompt = PromptTemplate(
+        template=PROMPT_TEMPLATE, input_variables=["context", "question"]
+    )
+    retriever = vectorStore.as_retriever()
+
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    rag_chain = (
+            {"context": retriever | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+    )
+    try:
+        res = rag_chain.invoke(query)
+        return {"code": 200, "message": res}
+    except Exception as e:
+        raise HTTPException(status_code=500,detail=f"rag_chain failed: {e}")
